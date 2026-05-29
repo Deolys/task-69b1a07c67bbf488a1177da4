@@ -19,14 +19,12 @@ llm = ChatOpenAI(model_name="gpt-4o-mini", temperature=0.7, api_key=os.getenv("O
 
 # Helper to parse LLM output into intro and options
 def parse_intro_and_options(text: str) -> tuple[str, List[str]]:
-    # Expect format: first line intro, then numbered list of 3 options
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     if not lines:
         return "", []
     intro = lines[0]
     opts = []
     for line in lines[1:]:
-        # Remove leading numbers or bullets
         parts = line.split(")", 1)
         if len(parts) == 2:
             opt = parts[1].strip()
@@ -51,7 +49,6 @@ async def scene_node(state: GameState) -> Dict[str, Any]:
     intro, opts = parse_intro_and_options(text)
     state["intro"] = intro
     state["options"] = opts
-    # Prepare interrupt payload
     payload = {
         "type": "choice",
         "question": f"{intro}\n\nЧто делаем?",
@@ -102,7 +99,6 @@ def run_game(theme: str):
                     print(subchunk.get("ending", ""))
             break
     else:
-        # No interrupt, just print ending
         pass
 
 if __name__ == "__main__":
