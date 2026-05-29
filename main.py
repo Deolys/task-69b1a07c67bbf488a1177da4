@@ -7,94 +7,109 @@ from langgraph.types import interrupt, Command
 from langchain_openai import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 
-# Define the state of the graph
+# -----------------------------
+# 1. Define the graph state
+# -----------------------------
 class GameState(TypedDict):
     theme: str
-    scene: str
-    options: List[str]
-    choice: str | None
-    ending: str
+    intro: str = ""
+    options: List[str] = []
+    choice: str | None = None
+    ending: str = ""
 
-# LLM client (OpenAI)
-llm = ChatOpenAI(model_name="gpt-4o-mini", temperature=0.7, api_key=os.getenv("OPENAI_API_KEY"))
+# -----------------------------
+# 2. LLM wrapper
+# -----------------------------
+llm = ChatOpenAI(model_name="gpt-4o-mini", temperature=0.7)
 
-# Prompt for generating scene and options
-scene_prompt = ChatPromptTemplate.from_messages([
+# Prompt for generating intro and options
+intro_prompt = ChatPromptTemplate.from_messages([
     ("system", "You are a creative storyteller.") ,
-    ("user", "Generate a short opening (2-3 sentences) about the theme: {theme}. Then provide exactly three actions the hero can take. Respond with the scene first, then a numbered list of options on separate lines."),
+    ("human", "Topic: {theme}\nGenerate a short introduction (2-3 sentences) followed by exactly three distinct actions the hero can take. Return the intro first, then list the options each on a new line.")
 ])
 
-# Prompt for ending based on choice
+# Prompt for generating ending based on choice
 ending_prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are a concise storyteller.") ,
-    ("user", "Given the opening: {scene}\nUser chose option: {choice}\nWrite a short ending (2-3 sentences)."),
+    ("system", "You are a creative storyteller."),
+    ("human", "Intro: {intro}\nChoice: {choice}\nWrite a short ending (2-3 sentences) that reflects the chosen action.")
 ])
 
-# Node to generate scene and interrupt for choice
-async def generate_scene(state: GameState) -> Dict[str, Any]:
+# -----------------------------
+# 3. Node to generate intro and options
+# -----------------------------
+async def generate_intro(state: GameState) -> Dict[str, Any]:
     theme = state["theme"]
-    # Call LLM
-    result = await llm.ainvoke(scene_prompt.format(theme=theme))
-    text = result.content.strip()
-    # Split scene and options
+    response = await llm.invoke(intro_prompt.format(theme=theme))
+    text = response.content.strip()
+    # Split into intro and options
     parts = text.split("\n")
-    scene_text = parts[0]
-    opts = [p.strip() for p in parts[1:4]]
-    state.update({"scene": scene_text, "options": opts})
+    intro = parts[0]
+    opts = [p for p in parts[1:] if p.strip()]
+    state["intro"] = intro
+    state["options"] = opts
     # Prepare interrupt payload
     payload = {
         "type": "choice",
-        "question": f"{scene_text}\nWhat do you do?",
+        "question": f"{intro}\nWhat do you do?",
         "choices": opts,
     }
-    return interrupt(payload)
+    return {"__interrupt__": [payload]}
 
-# Node to process choice and generate ending
-async def finish_story(state: GameState) -> Dict[str, Any]:
-    # state now contains 'choice'
-    scene = state["scene"]
-    choice = state["choice"]
-    result = await llm.ainvoke(ending_prompt.format(scene=scene, choice=choice))
-    ending_text = result.content.strip()
-    state.update({"ending": ending_text})
+# -----------------------------
+# 4. Node to handle user choice and generate ending
+# -----------------------------
+async def process_choice(state: GameState) -> Dict[str, Any]:
+    # The interrupt payload will be merged into state by the graph
+    if state.get("choice") is None:
+        raise ValueError("Choice not found in state after interruption.")
+    response = await llm.invoke(ending_prompt.format(intro=state["intro"], choice=state["choice"]))
+    ending = response.content.strip()
+    state["ending"] = ending
     return state
 
-# Build graph
+# -----------------------------
+# 5. Build the graph
+# -----------------------------
 graph_builder = StateGraph(GameState)
-graph_builder.add_node("generate", generate_scene)
-graph_builder.add_node("finish", finish_story)
-graph_builder.set_entry_point("generate")
-graph_builder.add_edge(START, "generate")
-graph_builder.add_edge("generate", "finish")
-# No further edges; graph ends after finish
+graph_builder.add_node("intro", generate_intro)
+graph_builder.add_node("choice", process_choice)
+graph_builder.set_entry_point("intro")
+graph_builder.add_edge(START, "intro")
+graph_builder.add_edge("intro", "choice")
+# No further edges; graph ends after choice node
 graph = graph_builder.compile(checkpointer=InMemorySaver())
 
-# Run the graph with interrupt handling
+# -----------------------------
+# 6. Run the graph with user interaction loop
+# -----------------------------
 async def run_game(theme: str):
-    from langchain_core.messages import BaseMessage
-    config = {"configurable": {"thread_id": "demo_thread"}}
-    # Start streaming
-    async for chunk in graph.stream(Command(), config=config):
+    config = {"configurable": {"thread_id": "demo-thread"}}
+    # Start streaming; we will handle interrupts manually
+    async for chunk in graph.stream(Command(), config):
         if isinstance(chunk, dict) and "__interrupt__" in chunk:
-            interrupt_payload = chunk["__interrupt__"][0].value
+            payload = chunk["__interrupt__"][0]
             answer = questionary.select(
-                interrupt_payload["question"],
-                choices=interrupt_payload["choices"],
+                message=payload["question"],
+                choices=payload["choices"]
             ).ask()
             # Resume with user's choice
-            resume_payload = {**interrupt_payload, "choice": answer}
-            async for _ in graph.stream(Command(resume=rescue_payload), config=config):
-                pass  # consume remaining chunks
+            resume_payload = {**payload, "choice": answer}
+            async for _ in graph.stream(Command(resume=resume_payload), config):
+                pass  # consume remaining chunks (ending)
         else:
-            # Print normal messages (scene or ending)
-            if isinstance(chunk, BaseMessage):
-                print(chunk.content)
-    # After completion, fetch final state
-    final_state = graph.get_state(config).data
+            # Print normal text chunks
+            print(chunk)
+    # After completion, print final state
+    final_state = await graph.get_state(config["configurable"]["thread_id"])
     print("\n--- Final State ---")
-    print(final_state)
+    print(f"Intro: {final_state['intro']}")
+    print(f"Choice: {final_state['choice']}")
+    print(f"Ending: {final_state['ending']}")
 
+# -----------------------------
+# 7. Entry point
+# -----------------------------
 if __name__ == "__main__":
+    theme = questionary.text("Enter a theme for the story:").ask()
     import asyncio
-    theme_input = questionary.text("Enter a theme for the adventure:").ask()
-    asyncio.run(run_game(theme_input))
+    asyncio.run(run_game(theme))
